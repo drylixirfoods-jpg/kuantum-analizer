@@ -1,0 +1,7 @@
+{
+  "name": "Copy of drylixirfoods",
+  "description": "A comprehensive suite of tools showcasing the power of the Gemini API, from real-time conversation and video generation to complex reasoning and content automation.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
