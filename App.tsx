@@ -1,15 +1,31 @@
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import { GoogleGenAI, Chat, GenerateContentResponse, Modality, Type, LiveServerMessage, Blob as GenAIBlob, FunctionDeclaration } from '@google/genai';
-import { ChatMessage, GroundingSource } from './types';
+import { GoogleGenAI, Chat, Type, Part } from '@google/genai';
+import { ChatMessage } from './types';
 
 // FIX: Define SpeechRecognition type as `any` to handle non-standard browser API
 // without full type declarations, resolving the "Cannot find name 'SpeechRecognition'" error.
 type SpeechRecognition = any;
 
+// --- TYPE DEFINITIONS ---
+interface ScheduledPost {
+    // FIX: Changed `content` from `any` to a more specific `Record<string, string>` type.
+    // This resolves downstream TypeScript errors where `ScheduledPost` objects were being
+    // inferred as `unknown`, preventing access to properties like `scheduledAt`.
+    content: Record<string, string>; 
+    scheduledAt: Date | null;
+}
+
+interface ActivityLogItem {
+    message: string;
+    timestamp: Date;
+    icon: React.ReactElement;
+}
+
+
 // --- UTILITY & HELPER FUNCTIONS ---
 
-const fileToGenerativePart = async (file: File) => {
+const fileToGenerativePart = async (file: File): Promise<Part> => {
   const base64EncodedDataPromise = new Promise<string>((resolve) => {
     const reader = new FileReader();
     reader.onloadend = () => resolve((reader.result as string).split(',')[1]);
@@ -20,629 +36,685 @@ const fileToGenerativePart = async (file: File) => {
   };
 };
 
-const base64Encode = (bytes: Uint8Array): string => {
-  let binary = '';
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-};
-
-const base64Decode = (base64: string): Uint8Array => {
-  const binaryString = atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes;
-};
-
-const decodeAudioData = async (
-  data: Uint8Array,
-  ctx: AudioContext,
-  sampleRate: number,
-  numChannels: number,
-): Promise<AudioBuffer> => {
-  const dataInt16 = new Int16Array(data.buffer);
-  const frameCount = dataInt16.length / numChannels;
-  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
-
-  for (let channel = 0; channel < numChannels; channel++) {
-    const channelData = buffer.getChannelData(channel);
-    for (let i = 0; i < frameCount; i++) {
-      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
-    }
-  }
-  return buffer;
+const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onload = () => resolve((reader.result as string).split(',')[1]);
+        reader.onerror = (error) => reject(error);
+    });
 };
 
 
-// --- UI COMPONENTS (Modernized) ---
-
-const Spinner: React.FC = () => (
-    <div className="flex space-x-1 justify-center items-center">
-        <div className="h-2 w-2 bg-white rounded-full animate-bounce [animation-delay:-0.3s]"></div>
-        <div className="h-2 w-2 bg-white rounded-full animate-bounce [animation-delay:-0.15s]"></div>
-        <div className="h-2 w-2 bg-white rounded-full animate-bounce"></div>
-    </div>
-);
-
-const ModernButton: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & { isLoading?: boolean }> = ({ children, isLoading, ...props }) => (
-    <button
-        {...props}
-        className={`w-full bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white font-bold py-3 px-6 rounded-lg shadow-md hover:shadow-lg transition-all transform hover:-translate-y-0.5 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none disabled:shadow-none flex items-center justify-center ${props.className}`}
-    >
-        {isLoading ? <Spinner /> : children}
-    </button>
-);
-
-const ComponentWrapper: React.FC<{ children: React.ReactNode; className?: string }> = ({ children, className = '' }) => (
-    <div className={`bg-slate-800/50 backdrop-blur-sm border border-slate-700 rounded-2xl p-6 md:p-8 shadow-2xl animate-fade-in space-y-6 ${className}`}>
-        {children}
-    </div>
-);
-
-
-interface ApiKeySelectorProps {
-    onApiKeyReady: () => void;
-}
-
-const ApiKeySelector: React.FC<ApiKeySelectorProps> = ({ onApiKeyReady }) => {
-    const [isChecking, setIsChecking] = useState(true);
-    const [hasKey, setHasKey] = useState(false);
-
-    const checkKey = useCallback(async () => {
-        setIsChecking(true);
-        if (window.aistudio) {
-            const keyIsSet = await window.aistudio.hasSelectedApiKey();
-            setHasKey(keyIsSet);
-            if (keyIsSet) {
-                onApiKeyReady();
-            }
-        }
-        setIsChecking(false);
-    }, [onApiKeyReady]);
-
-    useEffect(() => {
-        checkKey();
-    }, [checkKey]);
-
-    const handleSelectKey = async () => {
-        if (window.aistudio) {
-            await window.aistudio.openSelectKey();
-            setHasKey(true);
-            onApiKeyReady();
-        }
-    };
-
-    if (isChecking) {
-        return <div className="flex items-center space-x-2 text-slate-400"><Spinner /><span>API Anahtarı Kontrol Ediliyor...</span></div>;
-    }
-
-    if (!hasKey) {
-        return (
-            <div className="p-6 bg-yellow-900/30 border border-yellow-700/50 rounded-lg text-center">
-                <p className="mb-4 text-yellow-200">Video oluşturma, kullanıcı tarafından seçilmiş bir API anahtarı gerektirir. Lütfen devam etmek için bir anahtar seçin. Faturalandırma uygulanır.</p>
-                <ModernButton onClick={handleSelectKey}>
-                    API Anahtarı Seç
-                </ModernButton>
-                <p className="mt-3 text-sm text-slate-400">
-                    Daha fazla bilgi için <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" rel="noopener noreferrer" className="underline hover:text-indigo-400">faturalandırma belgelerine</a> bakın.
-                </p>
-            </div>
-        );
-    }
-    
-    return null;
-};
-
-// --- FEATURE COMPONENTS (Results display) ---
-const DesktopCommandResult: React.FC<{ data: { command: string } }> = ({ data }) => (
-    <div className="space-y-4">
-        <h3 className="text-xl font-bold text-indigo-400 flex items-center gap-2">
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" /></svg>
-            Masaüstü Komutu
-        </h3>
-        <p className="text-slate-300">Aşağıdaki komutun yürütülmesi simüle ediliyor:</p>
-        <pre className="text-cyan-300 whitespace-pre-wrap font-mono text-sm bg-slate-900/50 p-4 rounded-lg border border-slate-700">
-            <code>{data.command}</code>
-        </pre>
-        <p className="text-xs text-slate-500">Not: Bu, tarayıcı güvenlik kısıtlamaları nedeniyle bir simülasyondur.</p>
-    </div>
-);
-
-const ActionResultReport: React.FC<{ data: ActionResult }> = ({ data }) => (
-    <div className="mt-4 border-t border-slate-700/50 pt-4 space-y-3">
-         <h4 className="text-sm font-bold text-cyan-400">İşlem Raporu</h4>
-         <div className="text-xs text-slate-400 space-y-2">
-            <p className="flex items-center gap-2"><strong>ID:</strong> <span className="font-mono bg-slate-700 px-1.5 py-0.5 rounded">{data.operationId}</span></p>
-            <p><strong>Zaman Damgası:</strong> {data.timestamp}</p>
-            <p><strong>Kullanıcı Komutu:</strong> <span className="italic">"{data.prompt}"</span></p>
-            <p><strong>Kullanılan Araç:</strong> <span className="font-mono text-indigo-300">{data.toolUsed}</span></p>
-            <p><strong>Durum:</strong> <span className="text-green-400 font-semibold">{data.status} - {data.summary}</span></p>
-         </div>
-    </div>
-);
-
-
-const AIGrowthEngineResult: React.FC<{ data: any }> = ({ data }) => (
-    <div className="space-y-6">
-        <div>
-            <h3 className="text-xl font-bold text-indigo-400">Hedef Kitle Personalari</h3>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-2">
-                {data.targetAudience.personas.map((persona: any, index: number) => (
-                    <div key={index} className="bg-slate-700/50 p-4 rounded-lg">
-                        <h4 className="font-semibold text-cyan-300">{persona.name}</h4>
-                        <p><strong>Demografi:</strong> {persona.demographics}</p>
-                        <p><strong>Zorluklar:</strong> {persona.painPoints}</p>
-                        <p><strong>Motivasyonlar:</strong> {persona.motivations}</p>
-                    </div>
-                ))}
-            </div>
-        </div>
-         <div>
-            <h3 className="text-xl font-bold text-indigo-400">Platform Stratejileri</h3>
-             {data.platformStrategies.map((strategy: any, index: number) => (
-                <div key={index} className="bg-slate-700/50 p-4 rounded-lg mt-2">
-                    <h4 className="font-semibold text-cyan-300">{strategy.platform}</h4>
-                    <p><strong>İçerik Sütunları:</strong> {strategy.contentPillars.join(', ')}</p>
-                    <p><strong>Video Konsepti:</strong> {strategy.videoStrategy.concept}</p>
-                    <p className="font-mono bg-slate-800 p-2 rounded text-sm mt-1"><strong>Veo Komutu:</strong> {strategy.videoStrategy.veoPrompt}</p>
-                    <p><strong>Kurşun Mıknatısı:</strong> {strategy.leadMagnet}</p>
-                    <p><strong>Örnek DM:</strong> {strategy.sampleDM}</p>
-                </div>
-            ))}
-        </div>
-    </div>
-);
-
-
-const WebSearchResult: React.FC<{ data: { result: string; sources: GroundingSource[] } }> = ({ data }) => (
-     <div className="space-y-4">
-        <p className="text-slate-300 whitespace-pre-wrap">{data.result}</p>
-        {data.sources.length > 0 && (
-            <div>
-                <h4 className="font-semibold text-md text-slate-400 mb-2">Kaynaklar:</h4>
-                <ul className="list-disc list-inside space-y-1">
-                    {data.sources.map((source, index) => source.web?.uri && (
-                        <li key={index}>
-                            <a href={source.web.uri} target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:underline">
-                                {source.web.title || source.web.uri}
-                            </a>
-                        </li>
-                    ))}
-                </ul>
-            </div>
-        )}
-    </div>
-);
-
-const ComplexReasoningResult: React.FC<{ data: { result: string } }> = ({ data }) => (
-    <pre className="text-slate-300 whitespace-pre-wrap font-mono text-sm bg-slate-900/50 p-4 rounded-lg border border-slate-700">{data.result}</pre>
-);
-
-const OutreachAndVideoSuiteResult: React.FC<{ data: any }> = ({ data }) => {
-    return (
-        <div className="space-y-6">
-            <div>
-                <h3 className="text-xl font-bold text-indigo-400">Pazar Yerleri ve Müşteri Profili</h3>
-                <p><strong>Pazar Yerleri:</strong> {data.marketplaces.map((m: any) => m.name).join(', ')}</p>
-                <div className="bg-slate-700/50 p-4 rounded-lg mt-2">
-                    <h4 className="font-semibold text-cyan-300">{data.customerProfile.name}</h4>
-                    <p><strong>Demografi:</strong> {data.customerProfile.demographics}</p>
-                    <p><strong>Zorluklar:</strong> {data.customerProfile.painPoints}</p>
-                    <p><strong>Hedefler:</strong> {data.customerProfile.goals}</p>
-                </div>
-            </div>
-            <div>
-                <h3 className="text-xl font-bold text-indigo-400">İletişim Planı</h3>
-                {data.outreachPlan.emailTemplates.map((template: any, index: number) => (
-                    <div key={index} className="bg-slate-700/50 p-4 rounded-lg mt-2">
-                        <p><strong>E-posta Konusu:</strong> {template.subject}</p>
-                        <p><strong>İçerik:</strong> {template.body}</p>
-                    </div>
-                ))}
-                <p className="mt-2"><strong>Sosyal Medya Senaryosu:</strong> {data.outreachPlan.socialMediaScript}</p>
-                <p className="mt-2"><strong>WhatsApp Senaryosu:</strong> {data.outreachPlan.whatsappScript}</p>
-            </div>
-        </div>
-    );
-};
-
-const CodeArchitectResult: React.FC<{ data: { language: string; code: string; explanation: string; dependencies: string[] } }> = ({ data }) => {
-    const [copied, setCopied] = useState(false);
-
-    const handleCopy = () => {
-        navigator.clipboard.writeText(data.code);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
-    };
-
-    return (
-        <div className="space-y-6">
-            <div>
-                <h3 className="text-xl font-bold text-indigo-400">Yazılım Mimarisi ve Kod</h3>
-                <p className="text-slate-300 mt-2 whitespace-pre-wrap">{data.explanation}</p>
-            </div>
-            {data.dependencies && data.dependencies.length > 0 && (
-                 <div>
-                    <h4 className="font-semibold text-cyan-300">Gereksinimler</h4>
-                    <div className="flex flex-wrap gap-2 mt-2">
-                        {data.dependencies.map((dep, index) => (
-                            <span key={index} className="bg-slate-700 text-slate-300 text-xs font-mono px-2 py-1 rounded">{dep}</span>
-                        ))}
-                    </div>
-                </div>
-            )}
-            <div className="relative">
-                 <div className="bg-slate-900/70 rounded-t-lg px-4 py-2 border-b border-slate-700 flex justify-between items-center">
-                    <span className="text-sm font-mono text-slate-400">{data.language}</span>
-                    <button onClick={handleCopy} className="text-sm text-slate-400 hover:text-white transition-colors flex items-center gap-1">
-                        {copied ? (
-                           <> <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg> Kopyalandı </>
-                        ) : (
-                           <> <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg> Kopyala </>
-                        )}
-                    </button>
-                 </div>
-                 <pre className="text-slate-300 whitespace-pre-wrap font-mono text-sm bg-slate-900/50 p-4 rounded-b-lg overflow-x-auto">
-                    <code>{data.code}</code>
-                </pre>
-            </div>
-        </div>
-    );
-};
-
-const CreativeCanvasResult: React.FC<{ data: { prompt: string; imageBase64: string } }> = ({ data }) => (
-    <div className="space-y-4">
-        <h3 className="text-xl font-bold text-indigo-400">Yaratıcı Tuval</h3>
-        <p className="text-slate-400 italic">"{data.prompt}"</p>
-        <div className="bg-slate-900/50 p-2 rounded-lg border border-slate-700">
-            <img 
-                src={`data:image/png;base64,${data.imageBase64}`} 
-                alt={data.prompt}
-                className="rounded-md w-full h-auto"
-            />
-        </div>
-    </div>
-);
-
-const AutopilotPlanResult: React.FC<{ data: { goal: string; summary: string; steps: { title: string; details: string }[] } }> = ({ data }) => (
-    <div className="space-y-6">
-        <div>
-            <h3 className="text-xl font-bold text-indigo-400 flex items-center gap-2">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
-                Otopilot Planı
-            </h3>
-            <p className="text-slate-300 mt-1"><strong>Hedef:</strong> {data.goal}</p>
-        </div>
-        <div className="bg-slate-700/50 p-4 rounded-lg">
-            <h4 className="font-semibold text-cyan-300">Stratejik Özet</h4>
-            <p className="text-slate-300 mt-1 whitespace-pre-wrap">{data.summary}</p>
-        </div>
-        <div>
-            <h4 className="font-semibold text-cyan-300 mb-2">Adımlar</h4>
-            <div className="space-y-3">
-                {data.steps.map((step, index) => (
-                     <div key={index} className="flex items-start gap-3">
-                        <div className="flex-shrink-0 h-6 w-6 bg-indigo-500 rounded-full flex items-center justify-center text-sm font-bold text-white mt-1">{index + 1}</div>
-                        <div>
-                            <p className="font-semibold text-slate-200">{step.title}</p>
-                            <p className="text-slate-400 text-sm">{step.details}</p>
-                        </div>
-                    </div>
-                ))}
-            </div>
-        </div>
-    </div>
-);
-
-
-// --- MAIN APP COMPONENT ---
-interface ActionResult {
-    operationId: string;
-    timestamp: string;
-    prompt: string;
-    toolUsed: string;
-    status: 'Success' | 'Failure';
-    summary: string;
-}
-
-interface ConversationTurn {
-    role: 'user' | 'model';
-    text?: string;
-    tool?: {
-        name: string;
-        data: any;
-    };
-    report?: ActionResult;
-}
-
+// --- REACT COMPONENT ---
 
 const App: React.FC = () => {
-    const [prompt, setPrompt] = useState('');
-    const [isProcessing, setIsProcessing] = useState(false);
-    const [isListening, setIsListening] = useState(false);
-    const [conversation, setConversation] = useState<ConversationTurn[]>([
-        { role: 'model', text: 'Merhaba, ben sizin Gemini süper asistanınızım. Büyüme stratejileri oluşturabilir, internette araştırma yapabilir, kod yazabilir, görseller oluşturabilir, hedefleriniz için otopilot planları hazırlayabilir ve hatta sesli komutlarla masaüstü uygulamalarınızı yönetebilirim. Size nasıl yardımcı olabilirim?' }
-    ]);
-    const recognitionRef = useRef<SpeechRecognition | null>(null);
-    const conversationEndRef = useRef<HTMLDivElement>(null);
-    
-    useEffect(() => {
-        conversationEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }, [conversation]);
+  // General State
+  const [mode, setMode] = useState<'chat' | 'video' | 'reporting'>('chat');
+  const [ai, setAi] = useState<GoogleGenAI | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-    useEffect(() => {
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (SpeechRecognition) {
-            recognitionRef.current = new SpeechRecognition();
-            recognitionRef.current.continuous = false;
-            recognitionRef.current.lang = 'tr-TR';
-            recognitionRef.current.interimResults = false;
+  // Chat State
+  const [userInput, setUserInput] = useState('');
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [streamingResponse, setStreamingResponse] = useState('');
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const [imageFiles, setImageFiles] = useState<File[]>([]);
+  const [chat, setChat] = useState<Chat | null>(null);
+  const [isTtsEnabled, setIsTtsEnabled] = useState(true);
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  
+  // Video State
+  const [videoPrompt, setVideoPrompt] = useState('');
+  const [startImage, setStartImage] = useState<File | null>(null);
+  const [aspectRatio, setAspectRatio] = useState<'16:9' | '9:16' | '1:1'>('16:9');
+  const [resolution, setResolution] = useState<'720p' | '1080p'>('720p');
+  const [isVideoLoading, setIsVideoLoading] = useState(false);
+  const [videoLoadingMessage, setVideoLoadingMessage] = useState('');
+  const [generatedVideoUrl, setGeneratedVideoUrl] = useState<string | null>(null);
+  const [videoError, setVideoError] = useState<string | null>(null);
+  const [hasSelectedApiKey, setHasSelectedApiKey] = useState(false);
 
-            recognitionRef.current.onresult = (event) => {
-                const transcript = event.results[0][0].transcript;
-                setPrompt(transcript);
-                setIsListening(false);
-            };
-            recognitionRef.current.onerror = (event) => {
-                console.error('Speech recognition error:', event.error);
-                setIsListening(false);
-            };
-            recognitionRef.current.onend = () => {
-                 setIsListening(false);
-            };
-        }
-    }, []);
+  // Social Media Content State
+  const [socialPosts, setSocialPosts] = useState<Record<string, ScheduledPost> | null>(null);
+  const [isGeneratingPosts, setIsGeneratingPosts] = useState(false);
+  const [socialPostError, setSocialPostError] = useState<string | null>(null);
+  const [copiedStates, setCopiedStates] = useState<Record<string, boolean>>({});
+  const [isSchedulerOpen, setIsSchedulerOpen] = useState(false);
+  const [schedulingPost, setSchedulingPost] = useState<string | null>(null);
 
-    const handleVoiceInput = () => {
-        if (recognitionRef.current) {
-            if (isListening) {
-                recognitionRef.current.stop();
+  // Reporting State
+  const [activityLog, setActivityLog] = useState<ActivityLogItem[]>([]);
+  const [videosGeneratedCount, setVideosGeneratedCount] = useState(0);
+
+
+  const assistantAvatar = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAAEsCAYAAAB5fY51AAAAAXNSR0IArs4c6QAAADhlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAAqACAAQAAAABAAABLKADAAQAAAABAAABLAAAAAApkS4CAAAP+klEQVR4Aezd25LkNhJA0cz7v5xtL87d/YQJBEokSTw9VbNfC2C1vJSCQG6RkKjIyQIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACA+1a+AABgIq4XW/wz17v/83WvX/yX13u/f8X61/8r10sAAGxfuV5S8c/Xy8X/fP2W8/8t10sAAGxfuV5S8X/X8S3nf/v6LXJ9r8cDAECXyvWSiv/6+u3i/15v/Xhcr4d5HgDAXlIvKfn/vV4AALAV9ZKSd3hcr9c/j/cCAECX0ktK3uVxvfXjeR4AwF5SLyn5A+VxvfXjuV4AALCV1EtK/uAcr9d//Xg8BwCALqW/pOS/Pufjej0AALaJ/pKS/9wcr9e/Hs95AADYVfpLSv7zc7wAAGAH6S8p+d+d4wUAYAfpr3j5X+L/8hAAgJ2kv+Ll/27//58AAOzF/gUAsAn1AgCwibQCAEgTawUAsIl1AgBIC2sFALCJdQIASCtrBQCwS/QCAEgrawUAsEv1AgBILGsFALBL9QIASCxrBQCwS/UCAMgCawUAsEsVCACQYawVAMAmVCAAQJC1AgDYRAUCABSxrBUAwCZUIABAhrFWAAAgoQIBAMIs1goAYCAVCAAgxForAICBVCgAgLBrrQUAQEIlCgAgTFprAQCQKJUKACDUWisAgESpVAAAgdZaAwAgUaoUAECo1ZoAAMxQqVQAADHWGgIAMEOlUgEAxForAADRVCkVAECstVYAQDSVSgUAkGqtBQBAolQqAIBYa60BAIhUKgSAUGutBQBAIlUKACDUWmsAAJGoVAAAhFprDQCARKlUAACR1loDAJAolQoAILXWAABIlEoFABBqrQUAQLJUAgCARay1BgBAstQCAICFrLUGAECy1AIAgIWstQYAIKWlBgAQxForAICUVgMAiGqtBQBAaisBgBBqrQUAQGpLAQCEWmsNAICUVgIAIK21BgBAaisBABCttQYAQGprAQCEtNYAAFBbaQEAiK21BgBA7aUBAIDWWgMAoLbSAABgbWsBAFA7aQEAGNtaAAAUWgoAgNtaAwCAgpYCAMDa1gIAoKSlAACwtrUGACAlLQEA1gqrBQBAS0sBgDWCtQYAwNJSAGCNYK0BAGhZSgCwVlhQAADNLQUAVgrWGgCA5pYCALuE1QIAMKiUAWBXsNYAAAyqBADYpVprAAAGVQIA7NJajwEAzJIKAGCXtNYAAAySCgBgl7TWAACMFgIA2KutNQAAo2UBAOxqWmsAAMZaAgDY1bTWAgAwVgYAoLe1BgBAzJIKAIC3tQYAQMykCgCAp2kNACBmUgUAgGdqDQAgZlIFAIBnagaAmEUTAIAnag0AICYRAMCztQYAEJMIAAB2tQYAIBYRAAC7WgMAiEUBAAB2tQYAIBYBAAB2tR4DAIhiAQAAtrUGAEC0GAAAaFtrAAAiVQEAAFraGgBAqAoAAG1pDQAgVAUAAGhpDQAgUBUAAGhqAwBQVQEAgKYaAICqCgAAtDUAgFAFACAaDQBQVQEAoKEBAFBVAAAoqAEAqCoAAFRUAACoqgAAUFEBAFCqAgBAQQUAqKoAAFAFBQCqKgAAUCUFAKqqAACQUgEAKq0BAFBKCQCgtQYAoJQCAEBrDQBAKQUAqLUEAFBKAYDGWgMAUIoCAI21BgAgpQIAUGsJACCFAgBQa4kAIKUCABBqCQAgpQIAUGsJACCFAgDQa4kAIIUCANBqiQAgnQIA0GqJACCdAgDQaokAIIUCANBqiQAgnQIA0GqJACCdAgDQa4kAINkIAECbJQLAdggAQLokAsB2CACAtEgEsB0CADBTEgHshgAAzLBEALshAABzzBAA3A0BAJgTCgB3QwDAZgoAQLckAchOAAAzJwHITEkAEh4AADDHEoCEBwDAjEoAEh4AADNIAhAeAADMKAEg4QEAQIMkAAlIAIDMEgAkIAEAQBYIAhAeAABNkAAEIAEAQJYIAhAeAABNkAAEIAEAQJYIAhAeAABNkAAEIAEAIJYIAhAeAABNkAACEgEAxIIgAeEBAFBIEpA=";
+
+  const getAssistantMessage = () => {
+    return (
+      <div key="assistant-greeting" className="flex gap-3 items-start text-sm">
+        <img className="w-8 h-8 rounded-full filter drop-shadow-[0_0_3px_#14b8a6]" src={assistantAvatar} alt="Assistant Avatar" />
+        <div className="flex-1 bg-gray-800 rounded-lg p-3">
+          <p className="font-semibold text-teal-400">Angela Jolie</p>
+          <p className="text-gray-300">Merhaba! Size nasıl yardımcı olabilirim? Video oluşturma, sosyal medya içeriği hazırlama veya raporlama konularında size destek olabilirim.</p>
+        </div>
+      </div>
+    );
+  };
+  
+  // --- LIFECYCLE & INITIALIZATION ---
+
+  useEffect(() => {
+    const initRecognition = () => {
+      const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognitionAPI) {
+        const recognitionInstance = new SpeechRecognitionAPI();
+        recognitionInstance.continuous = true;
+        recognitionInstance.interimResults = true;
+        recognitionInstance.lang = 'tr-TR';
+        
+        recognitionInstance.onresult = (event: any) => {
+          let interimTranscript = '';
+          let finalTranscript = '';
+          for (let i = event.resultIndex; i < event.results.length; ++i) {
+            if (event.results[i].isFinal) {
+              finalTranscript += event.results[i][0].transcript;
             } else {
-                setIsListening(true);
-                setPrompt('');
-                recognitionRef.current.start();
+              interimTranscript += event.results[i][0].transcript;
             }
-        } else {
-            alert('Tarayıcınız ses tanımayı desteklemiyor.');
+          }
+          setUserInput(finalTranscript + interimTranscript);
+        };
+
+        recognitionInstance.onerror = (event: any) => {
+            console.error('Speech recognition error:', event.error);
+            setIsListening(false);
+        };
+        
+        recognitionInstance.onend = () => {
+            setIsListening(false);
+        };
+
+        recognitionRef.current = recognitionInstance;
+      }
+    };
+    initRecognition();
+    
+    // Initialize GoogleGenAI
+    if (process.env.API_KEY) {
+        setAi(new GoogleGenAI({ apiKey: process.env.API_KEY }));
+    } else {
+        setError("API anahtarı bulunamadı. Lütfen ortam değişkenlerini kontrol edin.");
+    }
+    
+    // Load TTS voices
+    const loadVoices = () => {
+        const synth = window.speechSynthesis;
+        const availableVoices = synth.getVoices();
+        setVoices(availableVoices);
+        if (synth.onvoiceschanged !== undefined) {
+            synth.onvoiceschanged = () => setVoices(synth.getVoices());
         }
     };
-    
-    const codeArchitectSchema = { type: Type.OBJECT, properties: { language: { type: Type.STRING }, code: { type: Type.STRING }, explanation: { type: Type.STRING }, dependencies: { type: Type.ARRAY, items: { type: Type.STRING } } }, required: ["language", "code", "explanation", "dependencies"] };
-    const autopilotPlanSchema = { type: Type.OBJECT, properties: { goal: { type: Type.STRING }, summary: { type: Type.STRING }, steps: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { title: { type: Type.STRING }, details: { type: Type.STRING } }, required: ["title", "details"] } } }, required: ["goal", "summary", "steps"] };
+    loadVoices();
 
-    const tools: FunctionDeclaration[] = [
-        { name: "generateGrowthPlan", description: "Kullanıcı bir ürün veya hizmet için pazarlama, satış veya büyüme stratejisi istediğinde bu aracı kullanın.", parameters: { type: Type.OBJECT, properties: { productDescription: { type: Type.STRING } }, required: ["productDescription"] } },
-        { name: "performWebSearch", description: "Kullanıcı güncel olaylar, haberler veya belirli bir konu hakkında bilgi aradığında bu aracı kullanın.", parameters: { type: Type.OBJECT, properties: { query: { type: Type.STRING } }, required: ["query"] } },
-        { name: "generateComplexReasoning", description: "Kullanıcı kodlama, karmaşık problem çözme, derinlemesine analiz veya uzun metin oluşturma gibi zorlu bir görev istediğinde bu aracı kullanın.", parameters: { type: Type.OBJECT, properties: { task: { type: Type.STRING } }, required: ["task"] } },
-        { name: "createOutreachPlan", description: "Kullanıcı bir ürün için pazar araştırması, müşteri profili, e-posta şablonları veya sosyal medya iletişim senaryoları istediğinde bu aracı kullanın.", parameters: { type: Type.OBJECT, properties: { productDescription: { type: Type.STRING } }, required: ["productDescription"] } },
-        { name: "architectCodeAndSystem", description: "Kullanıcı, yazılım mimarisi tasarlama, çeşitli dillerde (Python, Java, vb.) kod yazma, açık kaynaklı kütüphaneler önerme veya karmaşık teknik sistemler oluşturma gibi bir görev istediğinde bu aracı kullanın.", parameters: { type: Type.OBJECT, properties: { taskDescription: { type: Type.STRING } }, required: ["taskDescription"] } },
-        { name: "generateImageWithCanvas", description: "Kullanıcı bir görsel, çizim, resim veya tasarım konsepti oluşturulmasını istediğinde bu aracı kullanın.", parameters: { type: Type.OBJECT, properties: { prompt: { type: Type.STRING, description: "Oluşturulacak görselin açıklaması." } }, required: ["prompt"] } },
-        { name: "createAutopilotPlan", description: "Kullanıcı karmaşık bir hedef, proje veya amaç için adım adım bir stratejik plan ('otopilot' planı) istediğinde bu aracı kullanın.", parameters: { type: Type.OBJECT, properties: { goal: { type: Type.STRING, description: "Kullanıcının ulaşmak istediği nihai hedef." } }, required: ["goal"] } },
-        { name: "executeDesktopCommand", description: "Kullanıcı, bir masaüstü uygulamasını açmak, çalıştırmak veya kontrol etmek için sesli bir komut verdiğinde bu aracı kullanın (ör. 'Photoshop'u aç').", parameters: { type: Type.OBJECT, properties: { command: { type: Type.STRING, description: "Kullanıcının yürütmek istediği tam komut, ör. 'Adobe Photoshop'u Aç'." } }, required: ["command"] } }
-    ];
+  }, []);
 
-    const handleSubmit = async (e: React.FormEvent | React.KeyboardEvent) => {
-        e.preventDefault();
-        if (!prompt.trim()) return;
+  useEffect(() => {
+    if (ai) {
+        const newChat = ai.chats.create({ 
+            model: 'gemini-2.5-flash',
+            config: {
+                 systemInstruction: "Senin adın Angela Jolie, yardımsever ve ikna edici bir yapay zeka asistanısın. İnsanların video oluşturmasına, sosyal medya içerikleri hazırlamasına ve raporlar oluşturmasına yardımcı oluyorsun. Cevapların kısa, net ve her zaman yardımcı olmalı. Sadece Türkçe cevap ver."
+            }
+        });
+        setChat(newChat);
+    }
+  }, [ai]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, streamingResponse]);
+
+  // --- API KEY HANDLING ---
+  const checkApiKey = useCallback(async () => {
+    if (window.aistudio) {
+        const keySelected = await window.aistudio.hasSelectedApiKey();
+        setHasSelectedApiKey(keySelected);
+        return keySelected;
+    }
+    return false; // Fallback if aistudio is not available
+  }, []);
+
+  useEffect(() => {
+      if (mode === 'video') {
+        checkApiKey();
+      }
+  }, [mode, checkApiKey]);
+
+  const handleSelectKey = async () => {
+      if(window.aistudio) {
+        await window.aistudio.openSelectKey();
+        // Assume key selection is successful to avoid race conditions.
+        setHasSelectedApiKey(true);
+      }
+  };
+
+
+  // --- CORE FUNCTIONALITY HANDLERS ---
+  
+  const speak = (text: string) => {
+      if (!isTtsEnabled || !text) return;
+      
+      const synth = window.speechSynthesis;
+      // Stop any currently speaking utterance
+      synth.cancel();
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      const turkishVoice = voices.find(voice => voice.lang.startsWith('tr') && voice.name.includes('Female')) || voices.find(voice => voice.lang.startsWith('tr'));
+
+      if (turkishVoice) {
+          utterance.voice = turkishVoice;
+      } else {
+          console.warn("Türkçe kadın sesi bulunamadı. Varsayılan ses kullanılıyor.");
+      }
+      
+      utterance.onerror = (event) => {
+          console.error("SpeechSynthesisUtterance.onerror", event);
+          setError("Seslendirme sırasında bir hata oluştu.");
+      };
+      
+      synth.speak(utterance);
+  };
+
+
+  const handleSendMessage = useCallback(async () => {
+    if (!userInput.trim() && imageFiles.length === 0) return;
+    setIsChatLoading(true);
+    setError(null);
+
+    const userMessage: ChatMessage = { role: 'user', parts: [{ text: userInput }] };
+    setMessages(prev => [...prev, userMessage]);
+
+    try {
+      if (chat) {
+        setStreamingResponse('');
+        const parts: Part[] = [];
+        if(userInput.trim()) {
+            parts.push({text: userInput});
+        }
+        for (const file of imageFiles) {
+            parts.push(await fileToGenerativePart(file));
+        }
+
+        const result = await chat.sendMessageStream({ parts });
+        let accumulatedText = '';
+
+        for await (const chunk of result) {
+          const chunkText = chunk.text;
+          accumulatedText += chunkText;
+          setStreamingResponse(prev => prev + chunkText);
+        }
         
-        setIsProcessing(true);
-        const currentPrompt = prompt;
-        setConversation(prev => [...prev, { role: 'user', text: currentPrompt }]);
-        setPrompt('');
+        const modelMessage: ChatMessage = { role: 'model', parts: [{ text: accumulatedText }]};
+        setMessages(prev => [...prev, modelMessage]);
+        speak(accumulatedText);
 
+      }
+    } catch (err) {
+      console.error(err);
+      setError(err instanceof Error ? err.message : 'Mesaj gönderilirken bir hata oluştu.');
+    } finally {
+      setUserInput('');
+      setImageFiles([]);
+      setIsChatLoading(false);
+      setStreamingResponse('');
+    }
+  }, [userInput, imageFiles, chat, isTtsEnabled, voices]);
+
+  const toggleListening = () => {
+    if (!recognitionRef.current) return;
+    
+    if (isListening) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+    } else {
+      recognitionRef.current.start();
+      setIsListening(true);
+    }
+  };
+  
+    const generateSocialMediaPosts = async () => {
+        if (!ai) return;
+        setIsGeneratingPosts(true);
+        setSocialPostError(null);
+        setSocialPosts(null);
         try {
-            const ai = new GoogleGenAI({ apiKey: process.env.API_KEY as string });
             const response = await ai.models.generateContent({
                 model: 'gemini-2.5-pro',
-                contents: currentPrompt,
-                config: { tools: [{ functionDeclarations: tools }] }
+                contents: "Generate a week's worth of social media posts for a fictional tech company called 'Innovatech'. The posts should be for Twitter, Instagram, and LinkedIn. Provide varied content: a product announcement, a behind-the-scenes look, a tech tip, an industry news commentary, and a team spotlight. Ensure the tone is professional yet engaging.",
+                config: {
+                    responseMimeType: 'application/json',
+                    responseSchema: {
+                        type: Type.OBJECT,
+                        properties: {
+                            twitter: {
+                                type: Type.ARRAY,
+                                items: { type: Type.STRING }
+                            },
+                            instagram: {
+                                type: Type.ARRAY,
+                                items: { type: Type.STRING }
+                            },
+                            linkedin: {
+                                type: Type.ARRAY,
+                                items: { type: Type.STRING }
+                            }
+                        }
+                    }
+                }
             });
-            
-            const functionCalls = response.functionCalls;
-            if (functionCalls && functionCalls.length > 0) {
-                const call = functionCalls[0];
-                let newTurn: ConversationTurn = { role: 'model' };
-                let reportSummary = "";
-                
-                 switch (call.name) {
-                    case 'generateGrowthPlan':
-                        newTurn.tool = { name: 'AIGrowthEngineResult', data: { targetAudience: { personas: [{name: 'Teknoloji Meraklısı Tim', demographics: '25-40, şehirli, yazılım mühendisi', painPoints: 'Zaman yetersizliği', motivations: 'Verimlilik'}] }, platformStrategies: [{platform: 'YouTube', contentPillars: ['Eğitici içerikler'], videoStrategy: {concept: 'Kısa ve öz ipuçları', veoPrompt: 'modern bir ofiste verimlilik ipuçları veren bir video'}, leadMagnet: 'Ücretsiz e-kitap', sampleDM: 'Merhaba, ilginizi çekebilir...'}] } };
-                        reportSummary = "Büyüme planı oluşturuldu.";
-                        break;
-                    
-                    case 'performWebSearch': {
-                        // FIX: Cast `call.args.query` to string to ensure type safety for the `generateContent` call.
-                        const searchResponse = await ai.models.generateContent({ model: "gemini-2.5-flash", contents: call.args.query as string, config: { tools: [{ googleSearch: {} }] } });
-                        newTurn.tool = { name: 'WebSearchResult', data: { result: searchResponse.text, sources: searchResponse.candidates?.[0]?.groundingMetadata?.groundingChunks || [] } };
-                        reportSummary = "Web araması tamamlandı.";
-                        break;
-                    }
-                    case 'generateComplexReasoning': {
-                        // FIX: Cast `call.args.task` to string to ensure type safety for the `generateContent` call.
-                        const reasoningResponse = await ai.models.generateContent({ model: 'gemini-2.5-pro', contents: call.args.task as string, config: { thinkingConfig: { thinkingBudget: 32768 } } });
-                        newTurn.tool = { name: 'ComplexReasoningResult', data: { result: reasoningResponse.text } };
-                        reportSummary = "Karmaşık görev analizi tamamlandı.";
-                        break;
-                    }
-                    case 'createOutreachPlan': {
-                         newTurn.tool = { name: 'OutreachAndVideoSuiteResult', data: { marketplaces: [{name: 'Online Forumlar'}], customerProfile: {name: 'Küçük İşletme Sahibi', demographics: '30-50 yaş', painPoints: 'Pazarlama bütçesi kısıtlı', goals: 'Büyüme'}, outreachPlan: {emailTemplates: [{subject: 'İşletmeniz için bir fırsat', body: 'Merhaba...'}], socialMediaScript: 'Merhaba, profilinizi gördüm...', whatsappScript: 'Selamlar, size özel bir teklifimiz var.'} } };
-                         reportSummary = "İletişim ve pazar planı oluşturuldu.";
-                        break;
-                    }
-                    case 'architectCodeAndSystem': {
-                        const architectResponse = await ai.models.generateContent({ model: 'gemini-2.5-pro', contents: `Act as an expert software architect for this request: "${call.args.taskDescription}"`, config: { responseMimeType: "application/json", responseSchema: codeArchitectSchema } });
-                        try {
-                            const resultData = JSON.parse(architectResponse.text);
-                            newTurn.tool = { name: 'CodeArchitectResult', data: resultData };
-                            reportSummary = "Yazılım mimarisi ve kod başarıyla oluşturuldu.";
-                        } catch (parseError) {
-                            newTurn.text = "Kod oluşturma aracından gelen yanıtı işlerken bir hata oluştu.";
-                        }
-                        break;
-                    }
-                    case 'generateImageWithCanvas': {
-                        // FIX: Explicitly cast `call.args.prompt` to string to satisfy the `generateContent` type, which expects a string for the text part.
-                        const imageResponse = await ai.models.generateContent({ model: 'gemini-2.5-flash-image', contents: { parts: [{ text: call.args.prompt as string }] }, config: { responseModalities: [Modality.IMAGE] } });
-                        const part = imageResponse.candidates?.[0]?.content?.parts?.[0];
-                        if (part && 'inlineData' in part && part.inlineData) {
-                             newTurn.tool = { name: 'CreativeCanvasResult', data: { prompt: call.args.prompt, imageBase64: part.inlineData.data } };
-                             reportSummary = "Görsel başarıyla oluşturuldu.";
-                        } else {
-                             newTurn.text = "Görsel oluşturulamadı.";
-                        }
-                        break;
-                    }
-                     case 'createAutopilotPlan': {
-                        const planResponse = await ai.models.generateContent({ model: 'gemini-2.5-pro', contents: `Create a strategic, step-by-step autopilot plan for the following goal: "${call.args.goal}"`, config: { responseMimeType: "application/json", responseSchema: autopilotPlanSchema } });
-                        try {
-                            const resultData = JSON.parse(planResponse.text);
-                            newTurn.tool = { name: 'AutopilotPlanResult', data: resultData };
-                            reportSummary = "Otopilot strateji planı oluşturuldu.";
-                        } catch (parseError) {
-                            newTurn.text = "Otopilot planı oluşturulurken bir hata oluştu.";
-                        }
-                        break;
-                    }
-                    case 'executeDesktopCommand':
-                        newTurn.tool = { name: 'DesktopCommandResult', data: { command: call.args.command } };
-                        reportSummary = "Masaüstü komutu başarıyla simüle edildi.";
-                        break;
 
-                    default: {
-                        newTurn.text = "Anladım ama bu görevi yerine getirecek aracım yok.";
-                        break;
-                    }
-                }
-
-                if (newTurn.tool) {
-                    newTurn.report = {
-                        operationId: `OP-${Date.now()}`,
-                        timestamp: new Date().toLocaleString('tr-TR'),
-                        prompt: currentPrompt,
-                        toolUsed: call.name,
-                        status: 'Success',
-                        summary: reportSummary
+            const parsedPosts = JSON.parse(response.text);
+            const initialSchedule: Record<string, ScheduledPost> = {};
+            Object.keys(parsedPosts).forEach(platform => {
+                parsedPosts[platform].forEach((content: string, index: number) => {
+                    initialSchedule[`${platform}-${index}`] = {
+                        content: { platform, text: content },
+                        scheduledAt: null
                     };
-                }
-                setConversation(prev => [...prev, newTurn]);
-
-            } else {
-                setConversation(prev => [...prev, { role: 'model', text: response.text }]);
-            }
-
-        } catch (error) {
-            console.error("Assistant Error:", error);
-            setConversation(prev => [...prev, { role: 'model', text: "Bir hata oluştu. Lütfen konsolu kontrol edin." }]);
+                });
+            });
+            setSocialPosts(initialSchedule);
+            logActivity("Sosyal medya gönderileri oluşturuldu", <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M10 2a6 6 0 00-6 6v3.586l-.707.707A1 1 0 004 14h12a1 1 0 00.707-1.707L16 12.586V8a6 6 0 00-6-6zM10 18a3 3 0 01-3-3h6a3 3 0 01-3 3z" /></svg>);
+        } catch (err) {
+            console.error(err);
+            setSocialPostError(err instanceof Error ? err.message : 'Gönderi oluşturulurken bir hata oluştu.');
         } finally {
-            setIsProcessing(false);
+            setIsGeneratingPosts(false);
         }
     };
-    
-    const renderTool = (tool: {name: string, data: any}) => {
-        switch(tool.name) {
-            case 'AIGrowthEngineResult': return <AIGrowthEngineResult data={tool.data} />;
-            case 'WebSearchResult': return <WebSearchResult data={tool.data} />;
-            case 'ComplexReasoningResult': return <ComplexReasoningResult data={tool.data} />;
-            case 'OutreachAndVideoSuiteResult': return <OutreachAndVideoSuiteResult data={tool.data} />;
-            case 'CodeArchitectResult': return <CodeArchitectResult data={tool.data} />;
-            case 'CreativeCanvasResult': return <CreativeCanvasResult data={tool.data} />;
-            case 'AutopilotPlanResult': return <AutopilotPlanResult data={tool.data} />;
-            case 'DesktopCommandResult': return <DesktopCommandResult data={tool.data} />;
-            default: return null;
+
+    const handleGenerateVideo = async () => {
+        if (!videoPrompt.trim()) {
+            setVideoError('Lütfen bir video istemi girin.');
+            return;
         }
-    }
 
-    return (
-        <div className="min-h-screen bg-gray-900 text-white font-sans flex flex-col">
-            <header className="sticky top-0 z-10 bg-gray-900/70 backdrop-blur-md border-b border-slate-700/50">
-                <div className="container mx-auto px-4 sm:px-6 lg:px-8">
-                    <div className="flex justify-between items-center py-4">
-                        <div className="flex items-center space-x-2">
-                            <svg className="h-8 w-auto text-indigo-400" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M13.414 2.586a2 2 0 0 1 2.828 0l8 8a2 2 0 0 1 0 2.828l-12 12a2 2 0 0 1-2.828 0l-8-8a2 2 0 0 1 0-2.828l12-12Z" fill="currentColor"></path></svg>
-                            <h1 className="text-2xl font-bold text-slate-200">Gemini AI Assistant</h1>
-                        </div>
-                    </div>
-                </div>
-            </header>
-            
-            <div className="flex-grow container mx-auto p-4 sm:p-6 lg:p-8 grid grid-cols-1 lg:grid-cols-3 gap-8 items-start">
-                {/* Left Panel: Assistant Persona & Input */}
-                <div className="lg:col-span-1 lg:sticky lg:top-24 space-y-6">
-                    <div className="relative aspect-square max-w-sm mx-auto">
-                        <div className="absolute inset-0 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-full blur-2xl opacity-50"></div>
-                         <img 
-                            src="https://i.imgur.com/R23sH7d.png" 
-                            alt="AI Assistant - Angelina Jolie" 
-                            className="relative w-full h-full object-cover rounded-full border-4 border-slate-700 shadow-2xl"
-                        />
-                         <div className={`absolute inset-0 rounded-full border-4 border-indigo-400 transition-opacity duration-500 ${isProcessing ? 'opacity-100 animate-pulse' : 'opacity-0'}`}></div>
-                    </div>
-                    <div className="text-center space-y-2">
-                        <h2 className="text-2xl font-bold text-slate-200">Asistanınız</h2>
-                        <p className="text-slate-400">Görevi başlatmak için yazın veya konuşun.</p>
-                    </div>
-                    <form onSubmit={handleSubmit} className="space-y-4">
-                         <div className="relative">
-                            <textarea
-                                value={prompt}
-                                onChange={(e) => setPrompt(e.target.value)}
-                                placeholder="Mesajınız..."
-                                className="w-full h-24 bg-slate-800/80 text-white rounded-lg p-4 pr-16 border border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition resize-none"
-                                disabled={isProcessing || isListening}
-                                onKeyDown={(e) => {
-                                    if(e.key === 'Enter' && !e.shiftKey) {
-                                        e.preventDefault();
-                                        handleSubmit(e);
-                                    }
-                                }}
-                            />
-                            <button type="button" onClick={handleVoiceInput} className={`absolute top-4 right-4 p-2 rounded-full transition-colors ${isListening ? 'bg-red-500 text-white animate-pulse' : 'bg-slate-600 hover:bg-indigo-600 text-slate-300 hover:text-white'}`}
-                                aria-label="Sesli komut ver"
-                            >
-                                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
-                            </button>
-                        </div>
-                        <ModernButton type="submit" isLoading={isProcessing} disabled={isProcessing || !prompt.trim() || isListening}>
-                            Gönder
-                        </ModernButton>
-                    </form>
-                </div>
+        const keySelected = await checkApiKey();
+        if (!keySelected) {
+            setVideoError('Video oluşturmak için lütfen bir API anahtarı seçin.');
+            return;
+        }
+        
+        // Always create a new instance to ensure the latest key is used.
+        const currentAi = new GoogleGenAI({ apiKey: process.env.API_KEY! });
 
-                {/* Right Panel: Conversation / Workspace */}
-                <div className="lg:col-span-2 bg-slate-900/50 rounded-2xl border border-slate-700 h-[80vh] flex flex-col">
-                     <div className="flex-1 p-6 space-y-6 overflow-y-auto">
-                        {conversation.map((turn, index) => (
-                            <div key={index} className={`flex items-start gap-3 animate-fade-in ${turn.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                                {turn.role === 'model' && (
-                                    <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-cyan-500 flex-shrink-0"></div>
-                                )}
-                                <div className={`max-w-xl px-4 py-3 rounded-2xl ${turn.role === 'user' ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-slate-800 text-slate-200 rounded-bl-none'}`}>
-                                    {turn.text && <p className="whitespace-pre-wrap">{turn.text}</p>}
-                                    {turn.tool && renderTool(turn.tool)}
-                                    {turn.report && <ActionResultReport data={turn.report} />}
-                                </div>
-                             </div>
-                        ))}
-                        {isProcessing && (
-                            <div className="flex items-start gap-3">
-                                 <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-cyan-500 flex-shrink-0"></div>
-                                 <div className="max-w-xl px-4 py-3 rounded-2xl bg-slate-800 text-slate-200 rounded-bl-none">
-                                    <Spinner />
-                                 </div>
-                            </div>
-                        )}
-                        <div ref={conversationEndRef} />
-                    </div>
+        setIsVideoLoading(true);
+        setVideoError(null);
+        setGeneratedVideoUrl(null);
+        
+        const loadingMessages = [
+            "Video sihirbazlarımız iş başında...",
+            "Yaratıcı pikseller bir araya getiriliyor...",
+            "Neredeyse bitti, son dokunuşlar yapılıyor...",
+            "Harika bir şey geliyor..."
+        ];
+        let messageIndex = 0;
+        const intervalId = setInterval(() => {
+            messageIndex = (messageIndex + 1) % loadingMessages.length;
+            setVideoLoadingMessage(loadingMessages[messageIndex]);
+        }, 3000);
+        setVideoLoadingMessage(loadingMessages[0]);
+
+        try {
+            let startImagePart: { imageBytes: string; mimeType: string } | undefined = undefined;
+            if (startImage) {
+                const base64Data = await fileToBase64(startImage);
+                startImagePart = { imageBytes: base64Data, mimeType: startImage.type };
+            }
+
+            let operation = await currentAi.models.generateVideos({
+                model: 'veo-3.1-fast-generate-preview',
+                prompt: videoPrompt,
+                image: startImagePart,
+                config: {
+                    numberOfVideos: 1,
+                    resolution,
+                    aspectRatio,
+                }
+            });
+
+            while (!operation.done) {
+                await new Promise(resolve => setTimeout(resolve, 10000));
+                operation = await currentAi.operations.getVideosOperation({ operation });
+            }
+
+            const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
+            if (downloadLink) {
+                 const videoResponse = await fetch(`${downloadLink}&key=${process.env.API_KEY}`);
+                 const videoBlob = await videoResponse.blob();
+                 setGeneratedVideoUrl(URL.createObjectURL(videoBlob));
+                 setVideosGeneratedCount(prev => prev + 1);
+                 logActivity(`'${videoPrompt.substring(0, 20)}...' için video oluşturuldu`, <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M4 3a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V5a2 2 0 00-2-2H4zm3 2h6v4H7V5zm8 8H5v-2h10v2z" clipRule="evenodd" /></svg>);
+            } else {
+                 throw new Error("Video URI'si oluşturulamadı.");
+            }
+
+        } catch (err: any) {
+            console.error(err);
+            let errorMessage = err instanceof Error ? err.message : 'Video oluşturulurken bilinmeyen bir hata oluştu.';
+            if (errorMessage.includes("Requested entity was not found.")) {
+                errorMessage = "API anahtarı geçersiz veya bulunamadı. Lütfen yeni bir anahtar seçin.";
+                setHasSelectedApiKey(false); // Reset key state
+            }
+            setVideoError(errorMessage);
+        } finally {
+            setIsVideoLoading(false);
+            clearInterval(intervalId);
+            setVideoLoadingMessage('');
+        }
+    };
+
+
+    // --- UI HELPER & EVENT HANDLERS ---
+    const logActivity = (message: string, icon: React.ReactElement) => {
+        setActivityLog(prev => [{ message, timestamp: new Date(), icon }, ...prev]);
+    };
+
+    const handleCopyToClipboard = (text: string, id: string) => {
+        navigator.clipboard.writeText(text);
+        setCopiedStates(prev => ({...prev, [id]: true}));
+        setTimeout(() => setCopiedStates(prev => ({...prev, [id]: false})), 2000);
+    };
+
+    const openScheduler = (postId: string) => {
+        setSchedulingPost(postId);
+        setIsSchedulerOpen(true);
+    };
+
+    const handleSchedulePost = (e: React.FormEvent) => {
+        e.preventDefault();
+        const target = e.target as typeof e.target & { datetime: { value: string } };
+        const date = new Date(target.datetime.value);
+        if (schedulingPost && socialPosts) {
+            setSocialPosts(prev => ({
+                ...prev!,
+                [schedulingPost]: { ...prev![schedulingPost], scheduledAt: date }
+            }));
+            logActivity(`'${socialPosts[schedulingPost].content.platform}' için gönderi planlandı`, <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M6 2a1 1 0 00-1 1v1H4a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-1V3a1 1 0 10-2 0v1H7V3a1 1 0 00-1-1zm0 5a1 1 0 000 2h8a1 1 0 100-2H6z" clipRule="evenodd" /></svg>);
+        }
+        setIsSchedulerOpen(false);
+        setSchedulingPost(null);
+    };
+
+  // --- RENDER METHODS ---
+  const renderSidebar = () => (
+    <div className="w-1/4 bg-gray-900 p-6 flex flex-col justify-between border-r border-gray-700">
+      <div>
+        <div className="flex items-center gap-4 mb-8">
+          <div className="relative">
+            <img className="w-20 h-20 rounded-full object-cover filter drop-shadow-[0_0_8px_#14b8a6]" src={assistantAvatar} alt="Angela Jolie" />
+            <span className="absolute bottom-1 right-1 block h-4 w-4 rounded-full bg-green-400 border-2 border-gray-900"></span>
+          </div>
+          <div>
+            <h1 className="text-2xl font-bold text-white">Angela Jolie</h1>
+            <p className="text-sm text-gray-400">AI Asistanı</p>
+          </div>
+        </div>
+        <nav className="flex flex-col gap-2">
+          <button onClick={() => setMode('chat')} className={`flex items-center gap-3 p-3 rounded-lg transition-all ${mode === 'chat' ? 'bg-teal-500/20 text-teal-400' : 'text-gray-400 hover:bg-gray-700/50'}`}>
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
+            Sohbet Asistanı
+          </button>
+          <button onClick={() => setMode('video')} className={`flex items-center gap-3 p-3 rounded-lg transition-all ${mode === 'video' ? 'bg-teal-500/20 text-teal-400' : 'text-gray-400 hover:bg-gray-700/50'}`}>
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+            Video Oluşturucu
+          </button>
+          <button onClick={() => setMode('reporting')} className={`flex items-center gap-3 p-3 rounded-lg transition-all ${mode === 'reporting' ? 'bg-teal-500/20 text-teal-400' : 'text-gray-400 hover:bg-gray-700/50'}`}>
+             <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V7a2 2 0 012-2h2l2-3h4l2 3h2a2 2 0 012 2v10a2 2 0 01-2 2z" /></svg>
+            Raporlama & Otomasyon
+          </button>
+        </nav>
+      </div>
+      <div className="text-xs text-center text-gray-500">
+        &copy; {new Date().getFullYear()} Gemini Gelişmiş Araç Seti
+      </div>
+    </div>
+  );
+
+  const renderChat = () => (
+    <div className="flex-1 flex flex-col bg-gray-800">
+      <div className="flex-1 p-6 space-y-4 overflow-y-auto">
+        {messages.length === 0 ? getAssistantMessage() : messages.map((msg, index) => (
+          <div key={index} className={`flex gap-3 items-start text-sm ${msg.role === 'user' ? 'justify-end' : ''}`}>
+            {msg.role === 'model' && <img className="w-8 h-8 rounded-full filter drop-shadow-[0_0_3px_#14b8a6]" src={assistantAvatar} alt="Assistant Avatar" />}
+            <div className={`flex-1 max-w-xl rounded-lg p-3 ${msg.role === 'user' ? 'bg-teal-600 text-white' : 'bg-gray-700 text-gray-300'}`}>
+              {msg.role === 'model' && <p className="font-semibold text-teal-400 mb-1">Angela Jolie</p>}
+              <p className="whitespace-pre-wrap">{msg.parts.map(p => p.text).join('')}</p>
+            </div>
+          </div>
+        ))}
+        {streamingResponse && (
+          <div className="flex gap-3 items-start text-sm">
+            <img className="w-8 h-8 rounded-full filter drop-shadow-[0_0_3px_#14b8a6]" src={assistantAvatar} alt="Assistant Avatar" />
+            <div className="flex-1 max-w-xl bg-gray-700 rounded-lg p-3">
+              <p className="font-semibold text-teal-400 mb-1">Angela Jolie</p>
+              <p className="whitespace-pre-wrap text-gray-300">{streamingResponse}<span className="animate-pulse">▍</span></p>
+            </div>
+          </div>
+        )}
+        <div ref={chatEndRef} />
+      </div>
+      {error && <div className="p-4 text-red-400 bg-red-900/50">{error}</div>}
+      <div className="p-4 bg-gray-900 border-t border-gray-700">
+        <div className="flex items-center bg-gray-700 rounded-lg p-2">
+          <input
+            type="text"
+            className="flex-1 bg-transparent text-white placeholder-gray-400 focus:outline-none px-2"
+            placeholder="Angela Jolie'ye bir şey sorun..."
+            value={userInput}
+            onChange={(e) => setUserInput(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && !isChatLoading && handleSendMessage()}
+            disabled={isChatLoading}
+          />
+          <button onClick={toggleListening} className={`p-2 rounded-full transition-colors ${isListening ? 'bg-red-500 text-white animate-pulse' : 'text-gray-400 hover:bg-gray-600'}`} title="Sesli Giriş">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
+          </button>
+           <button onClick={() => setIsTtsEnabled(!isTtsEnabled)} className={`p-2 rounded-full transition-colors ${isTtsEnabled ? 'text-teal-400' : 'text-gray-500'} hover:bg-gray-600`} title="Sesli Yanıtları Aç/Kapat">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={isTtsEnabled ? "M15.536 8.464a5 5 0 010 7.072M20 4a9 9 0 010 16M3 9a3 3 0 013-3h3a3 3 0 013 3v6a3 3 0 01-3 3H6a3 3 0 01-3-3V9z" : "M5.586 15.586a5 5 0 007.07-7.07l-7.07 7.07zM19 12a9 9 0 01-9 9m-4-4l12-12"} /></svg>
+          </button>
+          <button onClick={handleSendMessage} disabled={isChatLoading} className="p-2 bg-teal-600 text-white rounded-full hover:bg-teal-500 disabled:bg-gray-500 transition-colors ml-2">
+            {isChatLoading ? <div className="w-6 h-6 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderVideo = () => (
+     <div className="flex-1 flex flex-col bg-gray-800 p-8 overflow-y-auto">
+        <h2 className="text-3xl font-bold text-white mb-6">Video Oluşturucu</h2>
+        {!hasSelectedApiKey ? (
+            <div className="bg-gray-700 p-6 rounded-lg text-center">
+                <h3 className="text-xl text-white font-semibold mb-2">Başlamadan Önce</h3>
+                <p className="text-gray-300 mb-4">Video oluşturma özellikleri, Gemini API'sini kullanır ve faturalandırma gerektirebilir. Lütfen devam etmek için bir API anahtarı seçin.</p>
+                <p className="text-xs text-gray-400 mb-4">Daha fazla bilgi için <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" rel="noopener noreferrer" className="text-teal-400 underline">faturalandırma belgelerine</a> göz atın.</p>
+                <button onClick={handleSelectKey} className="bg-teal-600 text-white px-6 py-2 rounded-lg hover:bg-teal-500 transition-colors">API Anahtarı Seç</button>
+            </div>
+        ) : (
+        <div className="space-y-6">
+            <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">Video İstemi</label>
+                <textarea
+                    value={videoPrompt}
+                    onChange={(e) => setVideoPrompt(e.target.value)}
+                    className="w-full bg-gray-700 text-white p-3 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none"
+                    rows={3}
+                    placeholder="Örn: Hızlı bir şekilde araba kullanan bir kedinin neon hologramı"
+                />
+            </div>
+             <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">Başlangıç Görüntüsü (İsteğe bağlı)</label>
+                <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => setStartImage(e.target.files ? e.target.files[0] : null)}
+                    className="w-full text-sm text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-teal-500/20 file:text-teal-400 hover:file:bg-teal-500/30"
+                />
+            </div>
+            <div className="grid grid-cols-2 gap-6">
+                 <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">En Boy Oranı</label>
+                    <select value={aspectRatio} onChange={(e) => setAspectRatio(e.target.value as any)} className="w-full bg-gray-700 text-white p-3 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                        <option value="16:9">16:9 (Manzara)</option>
+                        <option value="9:16">9:16 (Portre)</option>
+                        <option value="1:1">1:1 (Kare)</option>
+                    </select>
+                </div>
+                 <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">Çözünürlük</label>
+                    <select value={resolution} onChange={(e) => setResolution(e.target.value as any)} className="w-full bg-gray-700 text-white p-3 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                        <option value="720p">720p</option>
+                        <option value="1080p">1080p</option>
+                    </select>
                 </div>
             </div>
+            <button onClick={handleGenerateVideo} disabled={isVideoLoading} className="w-full bg-teal-600 text-white p-3 rounded-lg hover:bg-teal-500 disabled:bg-gray-600 transition-colors font-semibold flex items-center justify-center gap-2">
+                 {isVideoLoading && <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>}
+                {isVideoLoading ? 'Oluşturuluyor...' : 'Video Oluştur'}
+            </button>
+            {videoError && <p className="text-red-400 text-center">{videoError}</p>}
+
+            {(isVideoLoading || generatedVideoUrl) && (
+                <div className="mt-8">
+                    {isVideoLoading ? (
+                         <div className="text-center p-6 bg-gray-700/50 rounded-lg">
+                            <p className="text-teal-400 animate-pulse">{videoLoadingMessage}</p>
+                            <p className="text-xs text-gray-400 mt-2">Bu işlem birkaç dakika sürebilir.</p>
+                         </div>
+                    ) : (
+                        generatedVideoUrl && (
+                            <div>
+                                <h3 className="text-xl font-semibold text-white mb-4">Oluşturulan Video</h3>
+                                <video src={generatedVideoUrl} controls autoPlay loop className="w-full rounded-lg shadow-lg"></video>
+                            </div>
+                        )
+                    )}
+                </div>
+            )}
+        </div>
+        )}
+    </div>
+  );
+  
+    const renderReporting = () => (
+        <div className="flex-1 flex bg-gray-800 p-8 overflow-y-auto">
+            <div className="w-2/3 pr-8 border-r border-gray-700">
+                <h2 className="text-3xl font-bold text-white mb-6">İçerik Otomasyonu</h2>
+                <div className="bg-gray-700/50 p-6 rounded-lg">
+                    <div className="flex justify-between items-center mb-4">
+                        <h3 className="text-xl text-white font-semibold">Sosyal Medya Gönderileri</h3>
+                        <button onClick={generateSocialMediaPosts} disabled={isGeneratingPosts} className="bg-teal-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-teal-500 disabled:bg-gray-600 flex items-center gap-2">
+                           {isGeneratingPosts && <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>}
+                           {isGeneratingPosts ? "Oluşturuluyor..." : "Haftalık İçerik Oluştur"}
+                        </button>
+                    </div>
+
+                    {socialPostError && <p className="text-red-400 mb-4">{socialPostError}</p>}
+                    
+                    {isGeneratingPosts && !socialPosts && (
+                        <div className="text-center py-8">
+                            <p className="text-gray-300">Yaratıcı içerik motorları çalışıyor...</p>
+                        </div>
+                    )}
+
+                    {socialPosts && (
+                        <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-2">
+                            {/* FIX: Replaced Object.entries with Object.keys to ensure correct type inference for postData, resolving multiple "property does not exist on type 'unknown'" errors. */}
+                            {Object.keys(socialPosts).map(id => {
+                                const postData = socialPosts[id];
+                                return (
+                                <div key={id} className="bg-gray-800 p-4 rounded-lg">
+                                    <div className="flex justify-between items-start">
+                                        <div>
+                                          <p className="text-sm font-bold text-teal-400 capitalize">{postData.content.platform}</p>
+                                          <p className="text-gray-300 mt-1">{postData.content.text}</p>
+                                        </div>
+                                        <div className="flex items-center gap-2 ml-4">
+                                            <button onClick={() => handleCopyToClipboard(postData.content.text, id)} className="text-gray-400 hover:text-white transition-colors" title="Kopyala">
+                                                {copiedStates[id] ? <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-green-400" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" /></svg> : <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m-6 4h.01M9 16h.01" /></svg>}
+                                            </button>
+                                            <button onClick={() => openScheduler(id)} className="text-gray-400 hover:text-white transition-colors" title="Planla">
+                                               <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+                                            </button>
+                                        </div>
+                                    </div>
+                                    {postData.scheduledAt && (
+                                        <p className="text-xs text-teal-400 mt-2 text-right">Planlandı: {postData.scheduledAt.toLocaleString()}</p>
+                                    )}
+                                </div>
+                            )})}
+                        </div>
+                    )}
+                </div>
+            </div>
+            <div className="w-1/3 pl-8">
+                <h2 className="text-3xl font-bold text-white mb-6">Genel Bakış</h2>
+                <div className="bg-gray-900/50 p-4 rounded-lg mb-6">
+                    <h3 className="text-lg text-white font-semibold mb-2">İstatistikler</h3>
+                    <div className="flex justify-between items-center text-gray-300">
+                        <p>Oluşturulan Video Sayısı:</p>
+                        <p className="font-bold text-teal-400 text-2xl">{videosGeneratedCount}</p>
+                    </div>
+                     <div className="flex justify-between items-center text-gray-300 mt-2">
+                        <p>Planlanmış Gönderiler:</p>
+                        <p className="font-bold text-teal-400 text-2xl">{socialPosts ? (Object.values(socialPosts) as ScheduledPost[]).filter(p => p.scheduledAt).length : 0}</p>
+                    </div>
+                </div>
+                 <h3 className="text-lg text-white font-semibold mb-2">Aktivite Geçmişi</h3>
+                 <div className="space-y-3 max-h-[45vh] overflow-y-auto pr-2">
+                    {activityLog.length > 0 ? activityLog.map((item, index) => (
+                        <div key={index} className="flex items-start gap-3 text-sm">
+                            <span className="text-teal-400 mt-1">{item.icon}</span>
+                            <div>
+                               <p className="text-gray-300">{item.message}</p>
+                               <p className="text-xs text-gray-500">{item.timestamp.toLocaleTimeString()}</p>
+                            </div>
+                        </div>
+                    )) : <p className="text-sm text-gray-500">Henüz aktivite yok.</p>}
+                 </div>
+            </div>
+            {isSchedulerOpen && (
+                 <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+                    <div className="bg-gray-800 p-6 rounded-lg shadow-xl w-full max-w-sm">
+                       <h3 className="text-lg font-semibold text-white mb-4">Gönderiyi Planla</h3>
+                       <form onSubmit={handleSchedulePost}>
+                          <input type="datetime-local" name="datetime" className="w-full bg-gray-700 text-white p-2 rounded-lg mb-4" required />
+                          <div className="flex justify-end gap-3">
+                            <button type="button" onClick={() => setIsSchedulerOpen(false)} className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-500">İptal</button>
+                            <button type="submit" className="px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-500">Planla</button>
+                          </div>
+                       </form>
+                    </div>
+                 </div>
+            )}
         </div>
     );
+  
+
+  return (
+    <div className="h-screen w-screen flex font-sans text-white bg-gray-800">
+      {renderSidebar()}
+      <main className="flex-1 flex flex-col">
+        {mode === 'chat' && renderChat()}
+        {mode === 'video' && renderVideo()}
+        {mode === 'reporting' && renderReporting()}
+      </main>
+    </div>
+  );
 };
-
-
 export default App;
